@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-单机器学习分类器效果评估
-三个数据集 (Ransomware / miner1 / miner2) x 两个划分 (lab / wild) x 9 种方法
-每个方法文件含 confidence = P(malware) = P(label=1), 阈值 0.5
+Single-classifier evaluation utilities.
+Dataset registry and score loading.
+Each score file contains confidence = P(label=1).
 """
 import csv
 import os
@@ -15,20 +15,20 @@ THRESH = 0.5
 
 # ---------- IO helpers ----------
 def load_gt(path):
-    """真值 -> {id: label(int)}，同时把 filename 和 hash 两种形式都映射进去。"""
+    """Ground truth -> {id: label(int)}, keyed by both filename and hash."""
     key2label = {}
     n = 0
     with open(path, newline="", encoding="utf-8-sig") as f:
         r = csv.DictReader(f)
         for row in r:
             label = int(row["label"])
-            # 可能的标识列
+            # identifier columns
             for col in ("filename", "hash"):
                 v = row.get(col)
                 if v:
                     v = v.strip()
                     if v in key2label and key2label[v] != label:
-                        # 同一标识不同标签：保留首次，但记录冲突
+                        # same id with different labels: keep first, log conflict
                         pass
                     else:
                         key2label[v] = label
@@ -37,22 +37,22 @@ def load_gt(path):
 
 
 def load_result(path):
-    """结果文件 -> {id: confidence}。confidence 列固定；id 列优先 filename 否则 hash。
-    若同一 id 多次出现(如 fold)，取平均。返回 (dict, 总行数, 重复id信息)。"""
+    """Score file -> {id: confidence}. id column: filename preferred, else hash.
+    Duplicate ids are averaged. Returns (dict, row count, duplicate info)."""
     conf_sum = defaultdict(float)
     conf_cnt = defaultdict(int)
     total = 0
     with open(path, newline="", encoding="utf-8-sig") as f:
         r = csv.DictReader(f)
         fields = r.fieldnames
-        # 选 id 列
+        # pick id column
         if "filename" in fields:
             idcol = "filename"
         elif "hash" in fields:
             idcol = "hash"
         else:
             idcol = fields[0]
-        assert "confidence" in fields, f"{path} 缺 confidence 列: {fields}"
+        assert "confidence" in fields, f"{path}: missing confidence column: {fields}"
         for row in r:
             cid = row[idcol].strip()
             cstr = row["confidence"].strip()
@@ -75,7 +75,7 @@ def roc_auc(scores, labels):
     npos, nneg = len(pos), len(neg)
     if npos == 0 or nneg == 0:
         return float("nan")
-    # 合并排序求平均秩(处理同分)
+    # average ranks for ties
     allv = pos + neg
     order = sorted(range(len(allv)), key=lambda i: allv[i])
     ranks = [0.0] * len(allv)
@@ -84,7 +84,7 @@ def roc_auc(scores, labels):
         j = i
         while j + 1 < len(order) and allv[order[j + 1]] == allv[order[i]]:
             j += 1
-        avg = (i + 1 + j + 1) / 2.0  # 1-indexed 平均秩
+        avg = (i + 1 + j + 1) / 2.0  # 1-indexed average rank
         for k in range(i, j + 1):
             ranks[order[k]] = avg
         i = j + 1
@@ -108,7 +108,7 @@ def evaluate(scores, labels, thresh=THRESH):
     n = tp + fp + tn + fn
     acc = (tp + tn) / n if n else float("nan")
     prec = tp / (tp + fp) if (tp + fp) else 0.0
-    rec = tp / (tp + fn) if (tp + fn) else 0.0  # TPR / 检测率
+    rec = tp / (tp + fn) if (tp + fn) else 0.0  # TPR / detection rate
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
     fpr = fp / (fp + tn) if (fp + tn) else 0.0
     auc = roc_auc(scores, labels)
@@ -120,7 +120,7 @@ def evaluate(scores, labels, thresh=THRESH):
 
 
 # ---------- dataset config ----------
-# 每个数据集: (lab_gt, wild_gt, [(method, lab_file, wild_file), ...])
+# per dataset: (lab_gt, wild_gt, [(method, lab_file, wild_file), ...])
 DATASETS = {
     "Ransomware": {
         "lab_gt": "Ransomware/balanced_lab_dataset_1to2.csv",
@@ -138,23 +138,6 @@ DATASETS = {
             ("opcode", "opcode_lab_dataset_test_samples_probabilities_lab_results_fold_all.csv",
                       "opcode_realworld_dataset_probabilities.csv"),
             ("pf", "pf_best_models_confidences.csv", "pf_fold_1_xgb_predictions.csv"),
-        ],
-    },
-    "miner1": {
-        "lab_gt": "miner1/train_data_gt.csv",
-        "wild_gt": "miner1/miner_gt.csv",
-        "lab_dir": "miner1/6000_samples_results",
-        "wild_dir": "miner1/11g_results",
-        "methods": [
-            ("cfg", "cfg_6000_rewrite.csv", "cfg_11g_rewrite.csv"),
-            ("ember_gbdt", "ember_gdbt_result_6000.csv", "ember_gdbt_11g_resut.csv"),
-            ("fcg_gin", "fcg_gin_result_6000.csv", "fcg_gin_test11g_result_hejia_fix.csv"),
-            ("fe_gbdt", "fe_gdbt_result_6000.csv", "fe_gbdt_test11g_resut.csv"),
-            ("grayimg_cnn", "grayimg_cnn_result_6000.csv", "grayimg_cnn_test11g_result.csv"),
-            ("histogram_cnn", "histogram_cnn_result_6000.csv", "histogram_cnn_test11g_result.csv"),
-            ("histogram_mlp", "histogram_mlp_result_6000.csv", "histogram_mlp_test11g_result.csv"),
-            ("malconv", "malconv_result_6000.csv", "malconv_6000_test11g_result.csv"),
-            ("opcode_lstm", "opcode_lstm_result_6000.csv", "opcode_lstm_test11g_result.csv"),
         ],
     },
     "miner2": {
@@ -178,7 +161,7 @@ DATASETS = {
 
 
 def join(gt, res):
-    """返回 (labels, scores, 匹配数, 结果中未匹配数)"""
+    """Returns (labels, scores, matched count, unmatched count)"""
     labels, scores = [], []
     matched = 0
     unmatched = 0
@@ -193,17 +176,17 @@ def join(gt, res):
 
 
 def main():
-    rows = []  # 全部结果，用于写 CSV
+    rows = []  # all results for CSV output
     for dsname, cfg in DATASETS.items():
         print("=" * 92)
-        print(f"数据集: {dsname}")
+        print(f"dataset: {dsname}")
         print("=" * 92)
         lab_gt, lab_gt_n = load_gt(os.path.join(BASE, cfg["lab_gt"]))
         wild_gt, wild_gt_n = load_gt(os.path.join(BASE, cfg["wild_gt"]))
-        print(f"  真值: lab={lab_gt_n} 样本 (唯一id {len(lab_gt)}), wild={wild_gt_n} 样本 (唯一id {len(wild_gt)})")
+        print(f"  ground truth: lab={lab_gt_n} (unique {len(lab_gt)}), wild={wild_gt_n} (unique {len(wild_gt)})")
         for split, gt, gtn in (("lab", lab_gt, lab_gt_n), ("wild", wild_gt, wild_gt_n)):
             d = cfg["lab_dir"] if split == "lab" else cfg["wild_dir"]
-            print(f"\n  --- 划分: {split} ({'实验室/训练域' if split=='lab' else '在野/测试域'}) ---")
+            print(f"\n  --- split: {split} ---")
             hdr = f"  {'method':<14}{'n':>7}{'POS':>6}{'NEG':>6}{'TP':>6}{'FP':>6}{'TN':>6}{'FN':>6}{'ACC':>8}{'PREC':>8}{'TPR':>8}{'F1':>8}{'FPR':>8}{'AUC':>8}"
             print(hdr)
             print("  " + "-" * (len(hdr) - 2))
@@ -211,12 +194,12 @@ def main():
                 fname = labf if split == "lab" else wildf
                 path = os.path.join(BASE, d, fname)
                 if not os.path.exists(path):
-                    print(f"  {m:<14}  <缺失文件 {path}>")
+                    print(f"  {m:<14}  <missing file {path}>")
                     continue
                 res, total, dup = load_result(path)
                 labels, scores, matched, unmatched = join(gt, res)
                 if matched == 0:
-                    print(f"  {m:<14}  <无匹配: 结果{total}行, 未匹配{unmatched}>")
+                    print(f"  {m:<14}  <no match: {total} rows, {unmatched} unmatched>")
                     continue
                 mtr = evaluate(scores, labels)
                 cov = matched / gtn if gtn else 0
@@ -237,13 +220,13 @@ def main():
                 })
         print()
 
-    # 写汇总 CSV
+    # write summary CSV
     out = os.path.join(BASE, "single_classifier_metrics.csv")
     with open(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         w.writerows(rows)
-    print(f"\n[完成] 详细结果已写入: {out}  (共 {len(rows)} 条)")
+    print(f"\n[done] results written to {out}  ({len(rows)} rows)")
 
 
 if __name__ == "__main__":

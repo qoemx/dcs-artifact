@@ -1,20 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-S13: 完全实现算法版 DCS — 逐 Phase 对齐终版伪代码
-====================================================
-按算法实现, 不用旧捷径:
-  Phase 2: A* retention 打分 (W1 + exp(-λ_d·Δ))
-  Phase 3: HierCluster(1-R) + 每簇 argmax A* (聚类版剪枝, 非贪心)
-  Tier 1: IW 按算法 — balanced 判别器 + w=D/(1-D) + clip κ=20 + 加权损失
-目标: 检验"完全实现"后各数字如何变, 与现表对照
-所有数字真实落盘, 不预设结果。
+DCS reference implementation:
+MVS-LR construction, drift diagnosis, and Tier-1 adaptation.
+Run from the repository root:  python3 run_dcs.py
 """
 import os, sys
 import numpy as np
 
-DCS = "/home/ubuntu/OEMD_V2/+实验/dcs"
-sys.path.insert(0, DCS)
-sys.path.insert(0, "/tmp/oemd_audit")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from stacking import build_dataset, fit_lr, predict_lr, roc_auc
 
 TAU_A, LAM_D, TAU_D, TAU_C, TAU_COV, KAPPA = 0.55, 1.0, 0.6, 0.05, 0.65, 20.0
@@ -27,7 +20,7 @@ def w1_dist(a, b):
                                 - np.searchsorted(b, allv, 'right')/len(b))))
 
 def fit_lr_np_weighted(X, y, sw, lam=LAM_2, lr=0.05, iters=800):
-    """真加权损失 (非重采样) — 与算法 Tier1 的加权最小化一致"""
+    """Weighted loss minimization (true weighting, not resampling)."""
     X = np.asarray(X, float); y = np.asarray(y, float)
     mu = X.mean(0); sd = X.std(0); sd[sd == 0] = 1
     Xs = (X - mu) / sd
@@ -51,7 +44,7 @@ def predict_m(m, X):
     return 1 / (1 + np.exp(-np.clip(Xs @ m["w"] + m["b"], -40, 40)))
 
 def hier_cluster_prune(A_star, R, names):
-    """算法 Phase 3: 层次聚类(1-R 距离, 平均联动) + 每簇 argmax A*"""
+    """Hierarchical clustering (average linkage on 1-R) + per-cluster argmax A*."""
     from scipy.cluster.hierarchy import linkage, fcluster
     from scipy.spatial.distance import squareform
     k = len(names)
@@ -59,7 +52,7 @@ def hier_cluster_prune(A_star, R, names):
     np.fill_diagonal(dist, 0.0)
     dist = np.clip(dist, 0, None)
     Z = linkage(squareform(dist, checks=False), method="average")
-    # cut: 距离阈值 1-tau_D (R>=tau_D 同簇)
+    # cut height 1-tau_D (R >= tau_D in same cluster)
     labels = fcluster(Z, t=1.0 - TAU_D, criterion="distance")
     S = []
     for c in np.unique(labels):
@@ -70,20 +63,20 @@ def hier_cluster_prune(A_star, R, names):
 
 def main():
     rows = []
-    for ds in ["Ransomware", "miner1", "miner2"]:
+    for ds in ["Ransomware", "miner2"]:
         d = build_dataset(ds)
         names = d["retained"]; k = len(names)
         Xl, yl = np.array(d["Xl"]), np.array(d["yl"])
         Xw, yw = np.array(d["Xw"]), np.array(d["yw"])
 
-        # Phase 1 已由 build_dataset 完成 (校准+过滤)
+        # Phase 1 done in build_dataset (calibration + filtering)
 
-        # ---- Phase 2: A* (算法版) ----
+        # ---- Phase 2: retention scores ----
         delta = np.array([w1_dist(Xl[:, j], Xw[:, j]) for j in range(k)])
         A_lab = np.array([roc_auc(Xl[:, j].tolist(), yl.tolist()) for j in range(k)])
         A_star = A_lab * np.exp(-LAM_D * delta)
 
-        # ---- Phase 3: 聚类版剪枝 (算法版) ----
+        # ---- Phase 3: clustering + pruning ----
         E_mat = np.column_stack([(Xl[:, j] >= 0.5) != (yl == 1) for j in range(k)]).astype(int)
         Ec = E_mat - E_mat.mean(0)
         sd_ = np.sqrt((Ec**2).sum(0)); sd_[sd_ == 0] = 1
@@ -91,21 +84,21 @@ def main():
         S_alg, labels = hier_cluster_prune(A_star, R, names)
         S_full = list(range(k))
 
-        # ---- Phase 4: backbone (剪枝版 vs 全量版) ----
+        # ---- Phase 4: backbone (pruned vs full) ----
         f_prune = fit_lr(Xl[:, S_alg].tolist(), yl.tolist(), lam=LAM_2, lr=0.05, iters=800)
         auc_prune = roc_auc(predict_lr(f_prune, Xw[:, S_alg].tolist()), yw.tolist())
         f_full = fit_lr(Xl.tolist(), yl.tolist(), lam=LAM_2, lr=0.05, iters=800)
         auc_full = roc_auc(predict_lr(f_full, Xw.tolist()), yw.tolist())
 
         print(f"\n=== {ds} ===")
-        print(f"  聚类: {len(set(labels))} 簇 → 保留 {[names[j] for j in S_alg]}")
-        print(f"  backbone 全量: {auc_full:.4f} | 剪枝版: {auc_prune:.4f} (Δ{auc_prune-auc_full:+.4f})")
+        print(f"  clustering: {len(set(labels))} cluster → keep {[names[j] for j in S_alg]}")
+        print(f"  backbone full: {auc_full:.4f} | pruned: {auc_prune:.4f} (Δ{auc_prune-auc_full:+.4f})")
 
-        # ---- Phase 5: 诊断 ----
+        # ---- Phase 5: diagnosis ----
         Zl = Xl; Zw = Xw
         Xdom = np.vstack([Zl, Zw])
         ydom = np.concatenate([np.zeros(len(Zl)), np.ones(len(Zw))])
-        # balanced 判别器 (算法版: 等先验)
+        # balanced discriminator (equal priors)
         sw_dom = np.where(ydom == 1, 1.0/max((ydom==1).sum(),1), 1.0/max((ydom==0).sum(),1))
         sw_dom = sw_dom / sw_dom.sum() * len(ydom)
         m_dom = fit_lr_np_weighted(Xdom, ydom, sw_dom)
@@ -116,10 +109,10 @@ def main():
         aucs_dom = []
         for f in range(5):
             te = perm[f::5]
-            pte = predict_m(m_dom, Xdom[te])  # 简化: 全量拟合的CV近似
+            pte = predict_m(m_dom, Xdom[te])  # full-fit CV approximation
             aucs_dom.append(roc_auc(pte.tolist(), ydom[te].tolist()))
         G_cov = float(np.mean(aucs_dom))
-        # ECE (全量 wild 上的回顾性 G_con, 与论文同口径)
+        # ECE on full wild (retrospective, paper protocol)
         p0 = np.array(predict_lr(f_full, Xw.tolist()))
         edges = np.linspace(0, 1, 11); ece = 0.0
         for i in range(10):
@@ -127,7 +120,7 @@ def main():
             if m_.sum(): ece += m_.mean() * abs(yw[m_].mean() - p0[m_].mean())
         G_con = float(ece)
 
-        # ---- Tier 1: 算法版 IW ----
+        # ---- Tier 1: conditional IW ----
         tier1_open = (G_con < TAU_C) and (G_cov > TAU_COV)
         auc_t1 = auc_full
         t1_action = "freeze"
@@ -136,15 +129,15 @@ def main():
             w = np.clip(w_raw / np.clip(1 - w_raw, 1e-12, None), 1/KAPPA, KAPPA)
             f_iw = fit_lr_np_weighted(Xl, yl, w)
             auc_t1 = roc_auc(predict_m(f_iw, Xw).tolist(), yw.tolist())
-            t1_action = "enable IW (algorithm-exact)"
+            t1_action = "enable IW"
 
         print(f"  G_cov={G_cov:.3f} G_con={G_con:.3f} → Tier1: {t1_action}")
         print(f"  Tier1 AUC: {auc_t1:.4f} (vs backbone {auc_full:+.4f})")
 
         rows.append((ds, auc_full, auc_prune, G_cov, G_con, t1_action, auc_t1))
 
-    print("\n===== 汇总 (算法完全实现版) =====")
-    print(f"{'数据集':<12} {'backbone':>9} {'剪枝版':>9} {'Gcov':>6} {'Gcon':>6} {'Tier1':>8} {'T1 AUC':>8}")
+    print("\n===== Summary =====")
+    print(f"{'dataset':<12} {'backbone':>9} {'pruned':>9} {'Gcov':>6} {'Gcon':>6} {'Tier1':>8} {'T1 AUC':>8}")
     for r in rows:
         print(f"{r[0]:<12} {r[1]:>9.4f} {r[2]:>9.4f} {r[3]:>6.3f} {r[4]:>6.3f} "
               f"{('IW' if 'IW' in r[5] else 'freeze'):>8} {r[6]:>8.4f}")
